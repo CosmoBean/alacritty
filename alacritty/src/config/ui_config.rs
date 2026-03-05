@@ -136,7 +136,7 @@ impl UiConfig {
             working_directory,
             shell,
             drain_on_exit: false,
-            env: HashMap::new(),
+            env: self.env.clone(),
             #[cfg(target_os = "windows")]
             escape_args: false,
         }

@@ -22,6 +22,9 @@ pub struct Debug {
     /// The renderer alacritty should be using.
     pub renderer: Option<RendererPreference>,
 
+    /// Rendering backend selection for the compositor.
+    pub render_backend: RenderBackendPreference,
+
     /// Use EGL as display API if the current platform allows it.
     pub prefer_egl: bool,
 
@@ -41,9 +44,20 @@ impl Default for Debug {
             highlight_damage: Default::default(),
             ref_test: Default::default(),
             renderer: Default::default(),
+            render_backend: Default::default(),
             prefer_egl: Default::default(),
         }
     }
+}
+
+#[derive(
+    ConfigDeserialize, Serialize, Default, Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord,
+)]
+pub enum RenderBackendPreference {
+    #[default]
+    Auto,
+    Wgpu,
+    Gl,
 }
 
 /// The renderer configuration options.

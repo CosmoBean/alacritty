@@ -23,6 +23,7 @@ use crate::gl;
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
 
+pub mod backend;
 pub mod platform;
 pub mod rects;
 mod shader;

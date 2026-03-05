@@ -263,6 +263,9 @@ pub enum SocketMessage {
 
     /// Read runtime Alacritty configuration.
     GetConfig(IpcGetConfig),
+
+    /// Execute a v2 control-plane method.
+    V2(IpcV2Request),
 }
 
 /// Migrate the configuration file.
@@ -313,6 +316,14 @@ pub struct WindowOptions {
     /// Override configuration file options [example: 'cursor.style="Beam"'].
     #[clap(short = 'o', long, num_args = 1..)]
     option: Vec<String>,
+
+    /// Workspace identifier for the spawned terminal surface.
+    #[clap(long, hide = true)]
+    pub workspace_id: Option<String>,
+
+    /// Surface identifier for the spawned terminal surface.
+    #[clap(long, hide = true)]
+    pub surface_id: Option<String>,
 }
 
 impl WindowOptions {
@@ -350,6 +361,47 @@ pub struct IpcGetConfig {
     /// Use `-1` to get the global config.
     #[clap(short, long, allow_hyphen_values = true, env = "ALACRITTY_WINDOW_ID")]
     pub window_id: Option<i128>,
+}
+
+/// Generic v2 IPC request envelope.
+#[cfg(unix)]
+#[derive(Args, Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct IpcV2Request {
+    /// Method name (for example `identify` or `system.tree`).
+    #[clap(long)]
+    pub method: String,
+
+    /// Optional JSON method parameters.
+    #[clap(long)]
+    pub params: Option<String>,
+
+    /// Optional client-defined request id.
+    #[clap(long)]
+    pub request_id: Option<String>,
+
+    /// Window ID for request routing.
+    ///
+    /// Use `-1` to target all windows where applicable.
+    #[clap(short, long, allow_hyphen_values = true, env = "ALACRITTY_WINDOW_ID")]
+    pub window_id: Option<i128>,
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcV2Status {
+    Ok,
+    Error,
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct IpcV2Response {
+    pub method: String,
+    pub status: IpcV2Status,
+    pub request_id: Option<String>,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<String>,
 }
 
 /// Parsed CLI config overrides.

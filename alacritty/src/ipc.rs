@@ -16,7 +16,7 @@ use winit::window::WindowId;
 
 use alacritty_terminal::thread;
 
-use crate::cli::{Options, SocketMessage};
+use crate::cli::{IpcV2Response, Options, SocketMessage};
 use crate::event::{Event, EventType};
 
 /// Environment variable name for the IPC socket path.
@@ -83,6 +83,12 @@ pub fn spawn_ipc_socket(
                     let event = Event::new(EventType::IpcGetConfig(Arc::new(stream)), window_id);
                     let _ = event_proxy.send_event(event);
                 },
+                SocketMessage::V2(request) => {
+                    let window_id =
+                        request.window_id.and_then(|id| u64::try_from(id).ok()).map(WindowId::from);
+                    let event = Event::new(EventType::IpcV2(Arc::new(stream), request), window_id);
+                    let _ = event_proxy.send_event(event);
+                },
             }
         }
     });
@@ -126,6 +132,12 @@ fn handle_reply(stream: &UnixStream, message: &SocketMessage) -> IoResult<()> {
         // Write requested config to STDOUT.
         (SocketMessage::GetConfig(..), SocketReply::GetConfig(config)) => {
             println!("{config}");
+            Ok(())
+        },
+        (SocketMessage::V2(..), SocketReply::V2(reply)) => {
+            let json = serde_json::to_string(&reply)
+                .map_err(|err| IoError::other(format!("Invalid IPC format: {err}")))?;
+            println!("{json}");
             Ok(())
         },
         // Ignore requests without reply.
@@ -234,4 +246,5 @@ fn socket_prefix() -> String {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SocketReply {
     GetConfig(String),
+    V2(IpcV2Response),
 }

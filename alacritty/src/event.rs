@@ -14,6 +14,8 @@ use std::os::unix::io::RawFd;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::rc::Rc;
 #[cfg(unix)]
 use std::sync::Arc;
@@ -25,6 +27,10 @@ use crossfont::Size as FontSize;
 use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
 use log::{debug, error, info, warn};
+#[cfg(unix)]
+use serde_json::Value as JsonValue;
+#[cfg(unix)]
+use serde_json::json;
 use winit::application::ApplicationHandler;
 use winit::event::{
     ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
@@ -45,7 +51,7 @@ use alacritty_terminal::term::{self, ClipboardType, Term, TermMode};
 use alacritty_terminal::vte::ansi::NamedColor;
 
 #[cfg(unix)]
-use crate::cli::{IpcConfig, ParsedOptions};
+use crate::cli::{IpcConfig, IpcV2Request, IpcV2Response, IpcV2Status, ParsedOptions};
 use crate::cli::{Options as CliOptions, WindowOptions};
 use crate::clipboard::Clipboard;
 use crate::config::ui_config::{HintAction, HintInternalAction};
@@ -61,8 +67,24 @@ use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 #[cfg(unix)]
 use crate::ipc::{self, SocketReply};
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
+#[cfg(unix)]
+use crate::message_bar::MessageType;
 use crate::message_bar::{Message, MessageBuffer};
+#[cfg(unix)]
+use crate::runtime::graph::{
+    SurfaceKind, SurfaceSnapshot, WindowSnapshot, WorkspaceSnapshot, build_system_tree,
+};
+#[cfg(unix)]
+use crate::runtime::ids::{HandleKind, parse_handle_ref, workspace_ref};
+#[cfg(unix)]
+use crate::runtime::notification::{
+    NewNotification, NotificationRecord, NotificationStore, NotificationTarget,
+};
+#[cfg(unix)]
+use crate::runtime::workspace::{PaneTree, SplitDirection};
 use crate::scheduler::{Scheduler, TimerId, Topic};
+#[cfg(unix)]
+use crate::webview::WebviewStore;
 use crate::window_context::WindowContext;
 
 /// Duration after the last user input until an unlimited search is performed.
@@ -96,6 +118,12 @@ pub struct Processor {
     gl_config: Option<GlutinConfig>,
     #[cfg(unix)]
     global_ipc_options: ParsedOptions,
+    #[cfg(unix)]
+    notification_store: NotificationStore,
+    #[cfg(unix)]
+    webview_store: WebviewStore,
+    #[cfg(unix)]
+    workspace_trees: HashMap<u64, PaneTree, RandomState>,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
 }
@@ -140,6 +168,12 @@ impl Processor {
             windows: Default::default(),
             #[cfg(unix)]
             global_ipc_options: Default::default(),
+            #[cfg(unix)]
+            notification_store: Default::default(),
+            #[cfg(unix)]
+            webview_store: Default::default(),
+            #[cfg(unix)]
+            workspace_trees: Default::default(),
             config_monitor,
         }
     }
@@ -161,7 +195,14 @@ impl Processor {
         )?;
 
         self.gl_config = Some(window_context.display.gl_context().config());
-        self.windows.insert(window_context.id(), window_context);
+        let window_id = window_context.id();
+        self.windows.insert(window_id, window_context);
+        #[cfg(unix)]
+        {
+            let id: u64 = window_id.into();
+            self.workspace_trees.insert(id, PaneTree::new(format!("surface:{id}")));
+            self.refresh_agent_ui_all_windows();
+        }
 
         Ok(())
     }
@@ -190,8 +231,849 @@ impl Processor {
             config_overrides,
         )?;
 
-        self.windows.insert(window_context.id(), window_context);
+        let window_id = window_context.id();
+        self.windows.insert(window_id, window_context);
+        #[cfg(unix)]
+        {
+            let id: u64 = window_id.into();
+            self.workspace_trees
+                .entry(id)
+                .or_insert_with(|| PaneTree::new(format!("surface:{id}")));
+            self.refresh_agent_ui_all_windows();
+        }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn handle_ipc_v2(
+        &mut self,
+        request: IpcV2Request,
+        window_id: Option<WindowId>,
+    ) -> IpcV2Response {
+        let method = request.method;
+        let request_id = request.request_id;
+
+        let params = match request.params.as_deref() {
+            Some(params) => match serde_json::from_str(params) {
+                Ok(params) => params,
+                Err(err) => {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        format!("invalid JSON params: {err}"),
+                    );
+                },
+            },
+            None => JsonValue::Object(Default::default()),
+        };
+
+        if Self::is_focus_intent_v2_method(&method) {
+            return Self::ipc_v2_error(
+                method,
+                request_id.clone(),
+                String::from("focus-intent v2 commands are planned but not implemented yet"),
+            );
+        }
+
+        let method_name = method.clone();
+        match method_name.as_str() {
+            "identify" => {
+                let render_backend = match self.config.debug.render_backend {
+                    crate::config::debug::RenderBackendPreference::Auto => "auto",
+                    crate::config::debug::RenderBackendPreference::Wgpu => "wgpu",
+                    crate::config::debug::RenderBackendPreference::Gl => "gl",
+                };
+                let result = json!({
+                    "pid": std::process::id(),
+                    "socket": env::var("ALACRITTY_SOCKET").ok(),
+                    "window_id": window_id.map(|window_id| {
+                        let id: u64 = window_id.into();
+                        id
+                    }),
+                    "render_backend": render_backend,
+                    "version": env!("VERSION"),
+                });
+                Self::ipc_v2_ok(method, request_id.clone(), result)
+            },
+            "workspace.switch" => {
+                let Some(workspace_reference) =
+                    params.get("workspace_id").and_then(|value| value.as_str())
+                else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        String::from("missing required string field `workspace_id`"),
+                    );
+                };
+
+                let Some((kind, workspace_numeric_id)) = parse_handle_ref(workspace_reference)
+                else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        format!("invalid workspace reference `{workspace_reference}`"),
+                    );
+                };
+                if kind != HandleKind::Workspace {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        String::from("`workspace_id` must use `workspace:N` format"),
+                    );
+                }
+
+                let mut sorted_window_ids: Vec<u64> =
+                    self.windows.keys().copied().map(Into::into).collect();
+                sorted_window_ids.sort_unstable();
+
+                let exact_window_id = WindowId::from(workspace_numeric_id);
+                let target_window_id = if self.windows.contains_key(&exact_window_id) {
+                    Some(exact_window_id)
+                } else {
+                    let short_index = workspace_numeric_id.saturating_sub(1);
+                    usize::try_from(short_index)
+                        .ok()
+                        .and_then(|index| sorted_window_ids.get(index))
+                        .copied()
+                        .map(WindowId::from)
+                };
+
+                let Some(target_window_id) = target_window_id else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        format!("unknown workspace id `{workspace_reference}`"),
+                    );
+                };
+
+                if let Some(window_context) = self.windows.get(&target_window_id) {
+                    window_context.display.window.focus_window();
+                    window_context.display.window.set_urgent(false);
+                }
+                self.refresh_agent_ui_all_windows();
+
+                let window_numeric_id: u64 = target_window_id.into();
+                let result = json!({
+                    "workspace_id": workspace_ref(window_numeric_id),
+                    "window_id": window_numeric_id,
+                    "focused": true,
+                });
+                Self::ipc_v2_ok(method, request_id.clone(), result)
+            },
+            "system.tree" => {
+                let windows = self.windows.values().map(|window_context| {
+                    let window_id: u64 = window_context.id().into();
+                    let workspace_id = workspace_ref(window_id);
+                    let unread_count =
+                        self.notification_store.unread_count_for_workspace(&workspace_id);
+
+                    let mut surfaces = self
+                        .workspace_trees
+                        .get(&window_id)
+                        .map(|tree| {
+                            tree.surfaces()
+                                .into_iter()
+                                .filter_map(|reference| {
+                                    let (kind, id) = parse_handle_ref(reference)?;
+                                    if kind == HandleKind::Surface {
+                                        Some(SurfaceSnapshot { id, kind: SurfaceKind::Terminal })
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_else(|| {
+                            vec![SurfaceSnapshot { id: window_id, kind: SurfaceKind::Terminal }]
+                        });
+                    for webview in self.webview_store.list_for_workspace(&workspace_id) {
+                        if let Some((kind, id)) = parse_handle_ref(&webview.id)
+                            && kind == HandleKind::Surface
+                        {
+                            surfaces.push(SurfaceSnapshot { id, kind: SurfaceKind::Webview });
+                        }
+                    }
+
+                    WindowSnapshot {
+                        id: window_id,
+                        title: window_context.display.window.title().to_owned(),
+                        workspaces: vec![WorkspaceSnapshot {
+                            id: window_id,
+                            unread_count,
+                            surfaces,
+                        }],
+                    }
+                });
+                let tree = build_system_tree(windows);
+                let result =
+                    serde_json::to_value(tree).unwrap_or_else(|_| json!({ "windows": [] }));
+                Self::ipc_v2_ok(method, request_id.clone(), result)
+            },
+            "notification.create" => {
+                let mut sorted_window_ids: Vec<u64> =
+                    self.windows.keys().copied().map(Into::into).collect();
+                sorted_window_ids.sort_unstable();
+
+                let fallback_window_id =
+                    window_id.or_else(|| sorted_window_ids.first().copied().map(WindowId::from));
+                let requested_workspace_id =
+                    params.get("workspace_id").and_then(|value| value.as_str());
+
+                let (workspace_id, target_window_id) =
+                    if let Some(requested_workspace_id) = requested_workspace_id {
+                        let Some((kind, workspace_numeric_id)) =
+                            parse_handle_ref(requested_workspace_id)
+                        else {
+                            return Self::ipc_v2_error(
+                                method,
+                                request_id.clone(),
+                                String::from("`workspace_id` must use `workspace:N` format"),
+                            );
+                        };
+                        if kind != HandleKind::Workspace {
+                            return Self::ipc_v2_error(
+                                method,
+                                request_id.clone(),
+                                String::from("`workspace_id` must use `workspace:N` format"),
+                            );
+                        }
+
+                        let exact_window_id = WindowId::from(workspace_numeric_id);
+                        if self.windows.contains_key(&exact_window_id) {
+                            (requested_workspace_id.to_owned(), Some(exact_window_id))
+                        } else {
+                            // Accept stable short refs like `workspace:1` and map them to the
+                            // current sorted workspace list.
+                            let short_index = workspace_numeric_id.saturating_sub(1);
+                            let indexed_window_id = usize::try_from(short_index)
+                                .ok()
+                                .and_then(|index| sorted_window_ids.get(index))
+                                .copied()
+                                .map(WindowId::from);
+                            if let Some(indexed_window_id) = indexed_window_id {
+                                let numeric_id: u64 = indexed_window_id.into();
+                                (workspace_ref(numeric_id), Some(indexed_window_id))
+                            } else if let Some(fallback_window_id) = fallback_window_id {
+                                let numeric_id: u64 = fallback_window_id.into();
+                                (workspace_ref(numeric_id), Some(fallback_window_id))
+                            } else {
+                                (requested_workspace_id.to_owned(), None)
+                            }
+                        }
+                    } else if let Some(fallback_window_id) = fallback_window_id {
+                        let numeric_id: u64 = fallback_window_id.into();
+                        (workspace_ref(numeric_id), Some(fallback_window_id))
+                    } else {
+                        (String::from("workspace:global"), None)
+                    };
+                let surface_id =
+                    params.get("surface_id").and_then(|value| value.as_str()).map(str::to_owned);
+                let title = params
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("Agent requires attention")
+                    .to_owned();
+                let body = params
+                    .get("body")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+
+                let notification = self.notification_store.insert(NewNotification {
+                    target: NotificationTarget { workspace_id, surface_id },
+                    title,
+                    body,
+                });
+
+                if let Some(target_window_id) = target_window_id {
+                    let text = if notification.body.is_empty() {
+                        format!(
+                            "[Agent #{} | {}] {}",
+                            notification.id, notification.target.workspace_id, notification.title
+                        )
+                    } else {
+                        format!(
+                            "[Agent #{} | {}] {}\n{}",
+                            notification.id,
+                            notification.target.workspace_id,
+                            notification.title,
+                            notification.body
+                        )
+                    };
+                    let mut message = Message::new(text, MessageType::Warning);
+                    message.set_target(format!(
+                        "agent_notification:{}",
+                        notification.target.workspace_id
+                    ));
+                    let _ = self
+                        .proxy
+                        .send_event(Event::new(EventType::Message(message), target_window_id));
+
+                    if let Some(window_context) = self.windows.get(&target_window_id) {
+                        window_context.display.window.set_urgent(true);
+                    }
+                }
+                self.refresh_agent_ui_all_windows();
+                Self::send_system_notification(&notification.title, &notification.body);
+
+                let result = serde_json::to_value(notification)
+                    .unwrap_or_else(|_| json!({ "created": true }));
+                Self::ipc_v2_ok(method, request_id.clone(), result)
+            },
+            "notification.list" => {
+                let notifications = serde_json::to_value(self.notification_store.list())
+                    .unwrap_or_else(|_| json!([]));
+                Self::ipc_v2_ok(method, request_id.clone(), notifications)
+            },
+            "notification.mark_read" => {
+                let id = params.get("id").and_then(|value| value.as_u64());
+                let Some(id) = id else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        String::from("missing required numeric field `id`"),
+                    );
+                };
+
+                match self.mark_notification_read_and_refresh(id, true) {
+                    Some(notification) => {
+                        let result = serde_json::to_value(notification)
+                            .unwrap_or_else(|_| json!({ "id": id, "read": true }));
+                        Self::ipc_v2_ok(method, request_id.clone(), result)
+                    },
+                    None => Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        format!("notification `{id}` not found"),
+                    ),
+                }
+            },
+            "resolve.handle" => {
+                let Some(reference) = params.get("reference").and_then(|value| value.as_str())
+                else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        String::from("missing required string field `reference`"),
+                    );
+                };
+
+                let Some((kind, id)) = parse_handle_ref(reference) else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        format!("invalid handle reference `{reference}`"),
+                    );
+                };
+
+                let result = json!({
+                    "reference": reference,
+                    "kind": format!("{kind:?}").to_lowercase(),
+                    "id": id,
+                });
+                Self::ipc_v2_ok(method, request_id.clone(), result)
+            },
+            "surface.split" => {
+                let workspace_reference = params
+                    .get("workspace_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        window_id.map(|window_id| {
+                            let id: u64 = window_id.into();
+                            workspace_ref(id)
+                        })
+                    })
+                    .ok_or_else(|| String::from("missing required string field `workspace_id`"));
+                let workspace_reference = match workspace_reference {
+                    Ok(workspace_reference) => workspace_reference,
+                    Err(err) => return Self::ipc_v2_error(method, request_id.clone(), err),
+                };
+
+                let Some((kind, workspace_numeric_id)) = parse_handle_ref(&workspace_reference)
+                else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        format!("invalid workspace reference `{workspace_reference}`"),
+                    );
+                };
+                if kind != HandleKind::Workspace {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        String::from("`workspace_id` must use the `workspace:N` format"),
+                    );
+                }
+
+                let Some(target_surface_id) =
+                    params.get("target_surface_id").and_then(|value| value.as_str())
+                else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        String::from("missing required string field `target_surface_id`"),
+                    );
+                };
+                let Some((kind, _)) = parse_handle_ref(target_surface_id) else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        String::from("`target_surface_id` must use `surface:N` format"),
+                    );
+                };
+                if kind != HandleKind::Surface {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        String::from("`target_surface_id` must use `surface:N` format"),
+                    );
+                }
+                let Some(direction) = params
+                    .get("direction")
+                    .and_then(|value| value.as_str())
+                    .and_then(Self::parse_split_direction)
+                else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        String::from(
+                            "missing or invalid `direction` (expected left/right/up/down)",
+                        ),
+                    );
+                };
+
+                let Some(tree) = self.workspace_trees.get_mut(&workspace_numeric_id) else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        format!("unknown workspace id `{workspace_reference}`"),
+                    );
+                };
+
+                let new_surface_id = if let Some(new_surface_id) =
+                    params.get("new_surface_id").and_then(|value| value.as_str())
+                {
+                    let Some((kind, _)) = parse_handle_ref(new_surface_id) else {
+                        return Self::ipc_v2_error(
+                            method,
+                            request_id.clone(),
+                            String::from("`new_surface_id` must use `surface:N` format"),
+                        );
+                    };
+                    if kind != HandleKind::Surface {
+                        return Self::ipc_v2_error(
+                            method,
+                            request_id.clone(),
+                            String::from("`new_surface_id` must use `surface:N` format"),
+                        );
+                    }
+                    new_surface_id.to_owned()
+                } else {
+                    let next = workspace_numeric_id
+                        .saturating_mul(1_000)
+                        .saturating_add(tree.surfaces().len() as u64 + 1);
+                    format!("surface:{next}")
+                };
+
+                let split_ok = tree.split(target_surface_id, direction, new_surface_id.clone());
+                if !split_ok {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        format!("target surface `{target_surface_id}` not found"),
+                    );
+                }
+
+                let result = json!({
+                    "workspace_id": workspace_reference,
+                    "target_surface_id": target_surface_id,
+                    "new_surface_id": new_surface_id,
+                    "surfaces": tree.surfaces(),
+                });
+                self.refresh_agent_ui_all_windows();
+                Self::ipc_v2_ok(method, request_id.clone(), result)
+            },
+            "webview.open" => {
+                let Some(url) = params.get("url").and_then(|value| value.as_str()) else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        String::from("missing required string field `url`"),
+                    );
+                };
+
+                let workspace_id = params
+                    .get("workspace_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        window_id.map(|window_id| {
+                            let id: u64 = window_id.into();
+                            workspace_ref(id)
+                        })
+                    })
+                    .unwrap_or_else(|| String::from("workspace:global"));
+
+                let surface = self.webview_store.open(workspace_id, url.to_owned()).clone();
+                self.refresh_agent_ui_all_windows();
+                let result =
+                    serde_json::to_value(surface).unwrap_or_else(|_| json!({ "opened": true }));
+                Self::ipc_v2_ok(method, request_id.clone(), result)
+            },
+            "webview.navigate" => {
+                let Some(id) = params.get("id").and_then(|value| value.as_str()) else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        String::from("missing required string field `id`"),
+                    );
+                };
+                let Some(url) = params.get("url").and_then(|value| value.as_str()) else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        String::from("missing required string field `url`"),
+                    );
+                };
+
+                match self.webview_store.navigate(id, url.to_owned()).cloned() {
+                    Some(surface) => {
+                        self.refresh_agent_ui_all_windows();
+                        let result =
+                            serde_json::to_value(surface).unwrap_or_else(|_| json!({ "id": id }));
+                        Self::ipc_v2_ok(method, request_id.clone(), result)
+                    },
+                    None => Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        format!("unknown webview id `{id}`"),
+                    ),
+                }
+            },
+            "webview.close" => {
+                let Some(id) = params.get("id").and_then(|value| value.as_str()) else {
+                    return Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        String::from("missing required string field `id`"),
+                    );
+                };
+
+                if let Some(_closed) = self.webview_store.close(id) {
+                    self.refresh_agent_ui_all_windows();
+                    Self::ipc_v2_ok(method, request_id.clone(), json!({ "closed": true, "id": id }))
+                } else {
+                    Self::ipc_v2_error(
+                        method,
+                        request_id.clone(),
+                        format!("unknown webview id `{id}`"),
+                    )
+                }
+            },
+            "webview.list" => {
+                let surfaces =
+                    serde_json::to_value(self.webview_store.list()).unwrap_or_else(|_| json!([]));
+                Self::ipc_v2_ok(method, request_id.clone(), surfaces)
+            },
+            "workspace.create" | "workspace.close" | "workspace.move" | "surface.close" => {
+                Self::ipc_v2_error(
+                    method,
+                    request_id.clone(),
+                    String::from("method reserved for agent runtime and pending implementation"),
+                )
+            },
+            _ => Self::ipc_v2_error(method, request_id.clone(), String::from("unknown v2 method")),
+        }
+    }
+
+    #[cfg(unix)]
+    fn is_focus_intent_v2_method(method: &str) -> bool {
+        matches!(method, "surface.focus" | "notification.open")
+    }
+
+    #[cfg(unix)]
+    fn parse_split_direction(value: &str) -> Option<SplitDirection> {
+        match value {
+            "left" => Some(SplitDirection::Left),
+            "right" => Some(SplitDirection::Right),
+            "up" => Some(SplitDirection::Up),
+            "down" => Some(SplitDirection::Down),
+            _ => None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn refresh_agent_ui_all_windows(&mut self) {
+        let mut window_ids: Vec<WindowId> = self.windows.keys().copied().collect();
+        window_ids.sort_unstable_by_key(|window_id| {
+            let id: u64 = (*window_id).into();
+            id
+        });
+
+        for window_id in window_ids {
+            self.refresh_agent_ui_for_window(window_id);
+            self.refresh_agent_title_for_window(window_id);
+            self.refresh_urgency_for_window(window_id);
+        }
+    }
+
+    #[cfg(unix)]
+    fn compact_agent_text(value: &str, limit: usize) -> String {
+        if limit == 0 {
+            return String::new();
+        }
+
+        let mut compact = value.replace('\n', " ");
+        let mut count = compact.chars().count();
+        if count > limit {
+            let mut truncated = String::new();
+            for ch in compact.chars().take(limit.saturating_sub(3)) {
+                truncated.push(ch);
+            }
+            truncated.push_str("...");
+            compact = truncated;
+            count = compact.chars().count();
+        }
+
+        if count == 0 { String::from("-") } else { compact }
+    }
+
+    #[cfg(unix)]
+    fn strip_agent_title_suffix(title: &str) -> String {
+        const AGENT_TITLE_MARKER: &str = " | Agent[";
+        if let Some(index) = title.find(AGENT_TITLE_MARKER) {
+            title[..index].trim_end().to_owned()
+        } else {
+            title.to_owned()
+        }
+    }
+
+    #[cfg(unix)]
+    fn refresh_agent_title_for_window(&mut self, window_id: WindowId) {
+        let workspace_numeric_id: u64 = window_id.into();
+        let workspace_id = workspace_ref(workspace_numeric_id);
+
+        let mut all_workspace_ids: Vec<u64> =
+            self.windows.keys().copied().map(Into::into).collect();
+        all_workspace_ids.sort_unstable();
+
+        let tabs = all_workspace_ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let ws_id = workspace_ref(*id);
+                let unread = self.notification_store.unread_count_for_workspace(&ws_id);
+                let marker = if *id == workspace_numeric_id { "*" } else { "" };
+                format!("{marker}{}({unread})", index + 1)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let total_unread = all_workspace_ids
+            .iter()
+            .map(|id| self.notification_store.unread_count_for_workspace(&workspace_ref(*id)))
+            .sum::<usize>();
+        let latest = self
+            .notification_store
+            .latest_for_workspace(&workspace_id)
+            .map(|notification| Self::compact_agent_text(&notification.title, 20))
+            .unwrap_or_else(|| String::from("-"));
+        let suffix = format!(" | Agent[u:{total_unread} tabs:{tabs} latest:{latest}]");
+
+        if let Some(window_context) = self.windows.get_mut(&window_id) {
+            let base_title = Self::strip_agent_title_suffix(window_context.display.window.title());
+            window_context.display.window.set_title(format!("{base_title}{suffix}"));
+        }
+    }
+
+    #[cfg(unix)]
+    fn refresh_urgency_for_window(&mut self, window_id: WindowId) {
+        let workspace_numeric_id: u64 = window_id.into();
+        let workspace_id = workspace_ref(workspace_numeric_id);
+        let unread = self.notification_store.unread_count_for_workspace(&workspace_id);
+
+        if let Some(window_context) = self.windows.get(&window_id) {
+            window_context.display.window.set_urgent(unread > 0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn refresh_agent_ui_for_window(&mut self, window_id: WindowId) {
+        if !self.windows.contains_key(&window_id) {
+            return;
+        }
+
+        let workspace_numeric_id: u64 = window_id.into();
+        let workspace_id = workspace_ref(workspace_numeric_id);
+        let unread = self.notification_store.unread_count_for_workspace(&workspace_id);
+
+        let mut all_workspace_ids: Vec<u64> =
+            self.windows.keys().copied().map(Into::into).collect();
+        all_workspace_ids.sort_unstable();
+        let workspace_tabs = all_workspace_ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let ws_id = workspace_ref(*id);
+                let ws_unread = self.notification_store.unread_count_for_workspace(&ws_id);
+                let ws_surfaces =
+                    self.workspace_trees.get(id).map(|tree| tree.surfaces().len()).unwrap_or(1);
+                let ws_webviews = self.webview_store.list_for_workspace(&ws_id).len();
+                let latest = self
+                    .notification_store
+                    .latest_for_workspace(&ws_id)
+                    .map(|notification| Self::compact_agent_text(&notification.title, 18))
+                    .unwrap_or_else(|| String::from("-"));
+                let marker = if *id == workspace_numeric_id { "*" } else { "" };
+
+                format!(
+                    "[{}{} u:{} s:{} w:{} {}]",
+                    marker,
+                    index + 1,
+                    ws_unread,
+                    ws_surfaces,
+                    ws_webviews,
+                    latest
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let surfaces = self
+            .workspace_trees
+            .get(&workspace_numeric_id)
+            .map(|tree| tree.surfaces().into_iter().map(str::to_owned).collect::<Vec<_>>())
+            .unwrap_or_else(|| vec![format!("surface:{workspace_numeric_id}")]);
+
+        let webviews = self.webview_store.list_for_workspace(&workspace_id);
+        let webview_details = if webviews.is_empty() {
+            String::from("none")
+        } else {
+            webviews
+                .iter()
+                .map(|surface| format!("{}({})", surface.id, surface.url))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let recent = self
+            .notification_store
+            .recent(3)
+            .into_iter()
+            .map(|notification| {
+                let workspace = if let Some((HandleKind::Workspace, id)) =
+                    parse_handle_ref(&notification.target.workspace_id)
+                {
+                    format!("w{id}")
+                } else {
+                    notification.target.workspace_id.clone()
+                };
+                let state = if notification.read { "read" } else { "new" };
+                let title = Self::compact_agent_text(&notification.title, 20);
+                format!("#{} {} {} {}", notification.id, workspace, state, title)
+            })
+            .collect::<Vec<_>>();
+        let recent_text = if recent.is_empty() { String::from("none") } else { recent.join(" | ") };
+
+        let summary = format!("[Agent Tabs] {}", workspace_tabs.join(" "));
+        let detail = format!(
+            "current:{} unread:{} surfaces:{} webviews:{}\nsurfaces: {}\nwebviews: {}\nrecent: {}",
+            workspace_id,
+            unread,
+            surfaces.len(),
+            webviews.len(),
+            surfaces.join(", "),
+            webview_details,
+            recent_text
+        );
+
+        if let Some(window_context) = self.windows.get_mut(&window_id) {
+            window_context.set_tab_strip_text(Some(summary.clone()));
+        }
+
+        let mut message = Message::new(format!("{summary}\n{detail}"), MessageType::Warning);
+        message.set_target(format!("agent_ui:{workspace_id}"));
+        let _ = self.proxy.send_event(Event::new(EventType::Message(message), window_id));
+    }
+
+    #[cfg(unix)]
+    fn send_agent_ack_message(&self, notification: &NotificationRecord) {
+        if let Some((kind, workspace_numeric_id)) =
+            parse_handle_ref(&notification.target.workspace_id)
+        {
+            if kind == HandleKind::Workspace {
+                let workspace_window_id = WindowId::from(workspace_numeric_id);
+                if self.windows.contains_key(&workspace_window_id) {
+                    let mut message = Message::new(
+                        format!(
+                            "[Agent] Acknowledged #{} in {}: {}",
+                            notification.id,
+                            notification.target.workspace_id,
+                            Self::compact_agent_text(&notification.title, 36)
+                        ),
+                        MessageType::Warning,
+                    );
+                    message.set_target(format!("agent_ack:{}", notification.target.workspace_id));
+                    let _ = self
+                        .proxy
+                        .send_event(Event::new(EventType::Message(message), workspace_window_id));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn mark_notification_read_and_refresh(
+        &mut self,
+        id: u64,
+        emit_ack_message: bool,
+    ) -> Option<NotificationRecord> {
+        let notification = self.notification_store.mark_read(id)?.clone();
+        if emit_ack_message {
+            self.send_agent_ack_message(&notification);
+        }
+        self.refresh_agent_ui_all_windows();
+        Some(notification)
+    }
+
+    #[cfg(all(unix, target_os = "macos"))]
+    fn send_system_notification(title: &str, body: &str) {
+        let message = if body.is_empty() { title } else { body };
+        let escaped_message = Self::escape_osascript_string(message);
+        let escaped_subtitle = Self::escape_osascript_string(title);
+
+        let script = format!(
+            "display notification \"{escaped_message}\" with title \"Alacritty Agent\" subtitle \"{escaped_subtitle}\""
+        );
+        let _ = Command::new("osascript").arg("-e").arg(script).spawn();
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn send_system_notification(_title: &str, _body: &str) {}
+
+    #[cfg(all(unix, target_os = "macos"))]
+    fn escape_osascript_string(value: &str) -> String {
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
+    #[cfg(unix)]
+    fn ipc_v2_ok(method: String, request_id: Option<String>, result: JsonValue) -> IpcV2Response {
+        IpcV2Response {
+            method,
+            status: IpcV2Status::Ok,
+            request_id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn ipc_v2_error(method: String, request_id: Option<String>, error: String) -> IpcV2Response {
+        IpcV2Response {
+            method,
+            status: IpcV2Status::Error,
+            request_id,
+            result: None,
+            error: Some(error),
+        }
     }
 
     /// Run the event loop.
@@ -340,6 +1222,24 @@ impl ApplicationHandler<Event> for Processor {
                     ipc::send_reply(&mut stream, SocketReply::GetConfig(config_json));
                 }
             },
+            // Process v2 IPC requests.
+            #[cfg(unix)]
+            (EventType::IpcV2(stream, request), window_id) => {
+                let response = self.handle_ipc_v2(request, window_id.copied());
+                if let Ok(mut stream) = stream.try_clone() {
+                    ipc::send_reply(&mut stream, SocketReply::V2(response));
+                }
+            },
+            #[cfg(unix)]
+            (EventType::AgentNotificationAck(workspace_id), _) => {
+                if let Some(notification_id) = self
+                    .notification_store
+                    .latest_unread_for_workspace(&workspace_id)
+                    .map(|notification| notification.id)
+                {
+                    let _ = self.mark_notification_read_and_refresh(notification_id, true);
+                }
+            },
             (EventType::ConfigReload(path), _) => {
                 // Clear config logs from message bar for all terminals.
                 for window_context in self.windows.values_mut() {
@@ -422,6 +1322,14 @@ impl ApplicationHandler<Event> for Processor {
                     },
                     _ => return,
                 };
+                #[cfg(unix)]
+                {
+                    let id: u64 = window_context.id().into();
+                    self.workspace_trees.remove(&id);
+                    if !self.windows.is_empty() {
+                        self.refresh_agent_ui_all_windows();
+                    }
+                }
 
                 // Unschedule pending events.
                 self.scheduler.unschedule_window(window_context.id());
@@ -547,6 +1455,10 @@ pub enum EventType {
     IpcConfig(IpcConfig),
     #[cfg(unix)]
     IpcGetConfig(Arc<UnixStream>),
+    #[cfg(unix)]
+    IpcV2(Arc<UnixStream>, IpcV2Request),
+    #[cfg(unix)]
+    AgentNotificationAck(String),
     BlinkCursor,
     BlinkCursorTimeout,
     SearchNext,
@@ -933,6 +1845,18 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn pop_message(&mut self) {
         if !self.message_buffer.is_empty() {
             self.display.pending_update.dirty = true;
+            #[cfg(unix)]
+            if let Some(workspace_id) = self
+                .message_buffer
+                .message()
+                .and_then(|message| message.target())
+                .and_then(|target| target.strip_prefix("agent_notification:"))
+            {
+                let _ = self.event_proxy.send_event(Event::new(
+                    EventType::AgentNotificationAck(workspace_id.to_owned()),
+                    self.display.window.id(),
+                ));
+            }
             self.message_buffer.pop();
         }
     }
@@ -1854,9 +2778,23 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     self.ctx.display.cursor_hidden = false;
                     *self.ctx.dirty = true;
                 },
-                // Add message only if it's not already queued.
-                EventType::Message(message) if !self.ctx.message_buffer.is_queued(&message) => {
-                    self.ctx.message_buffer.push(message);
+                // For target-scoped messages, replace the previous message to keep the bar
+                // up to date. Agent notification and acknowledgement messages are prioritized.
+                EventType::Message(message) => {
+                    if let Some(target) = message.target().cloned() {
+                        let prioritize = target.starts_with("agent_notification:")
+                            || target.starts_with("agent_ack:");
+                        self.ctx.message_buffer.remove_target(&target);
+                        if prioritize {
+                            self.ctx.message_buffer.push_front(message);
+                        } else {
+                            self.ctx.message_buffer.push(message);
+                        }
+                    } else if self.ctx.message_buffer.is_queued(&message) {
+                        return;
+                    } else {
+                        self.ctx.message_buffer.push(message);
+                    }
                     self.ctx.display.pending_update.dirty = true;
                 },
                 EventType::Terminal(event) => match event {
@@ -1924,11 +2862,11 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     TerminalEvent::Exit | TerminalEvent::ChildExit(_) | TerminalEvent::Wakeup => (),
                 },
                 #[cfg(unix)]
-                EventType::IpcConfig(_) | EventType::IpcGetConfig(..) => (),
-                EventType::Message(_)
-                | EventType::ConfigReload(_)
-                | EventType::CreateWindow(_)
-                | EventType::Frame => (),
+                EventType::IpcConfig(_)
+                | EventType::IpcGetConfig(..)
+                | EventType::IpcV2(..)
+                | EventType::AgentNotificationAck(..) => (),
+                EventType::ConfigReload(_) | EventType::CreateWindow(_) | EventType::Frame => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
                 match event {

@@ -1,5 +1,6 @@
 //! Terminal window context.
 
+use std::env;
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
@@ -47,6 +48,7 @@ use crate::{input, renderer};
 /// Event context for one individual Alacritty window.
 pub struct WindowContext {
     pub message_buffer: MessageBuffer,
+    pub tab_strip_text: Option<String>,
     pub display: Display,
     pub dirty: bool,
     event_queue: Vec<WinitEvent<Event>>,
@@ -175,6 +177,17 @@ impl WindowContext {
         let mut pty_config = config.pty_config();
         options.terminal_options.override_pty_config(&mut pty_config);
 
+        let window_id: u64 = display.window.id().into();
+        let workspace_id =
+            options.workspace_id.clone().unwrap_or_else(|| format!("workspace:{window_id}"));
+        let surface_id =
+            options.surface_id.clone().unwrap_or_else(|| format!("surface:{window_id}"));
+        pty_config.env.insert(String::from("ALACRITTY_WORKSPACE_ID"), workspace_id);
+        pty_config.env.insert(String::from("ALACRITTY_SURFACE_ID"), surface_id);
+        if let Ok(socket) = env::var("ALACRITTY_SOCKET") {
+            pty_config.env.insert(String::from("ALACRITTY_SOCKET"), socket);
+        }
+
         let preserve_title = options.window_identity.title.is_some();
 
         info!(
@@ -246,6 +259,7 @@ impl WindowContext {
             prev_bell_cmd: Default::default(),
             inline_search_state: Default::default(),
             message_buffer: Default::default(),
+            tab_strip_text: None,
             window_config: Default::default(),
             search_state: Default::default(),
             event_queue: Default::default(),
@@ -392,6 +406,7 @@ impl WindowContext {
             terminal,
             scheduler,
             &self.message_buffer,
+            self.tab_strip_text.as_deref(),
             &self.config,
             &mut self.search_state,
         );
@@ -465,6 +480,7 @@ impl WindowContext {
                 &mut self.display,
                 &mut self.notifier,
                 &self.message_buffer,
+                self.tab_strip_text.as_deref(),
                 &mut self.search_state,
                 old_is_searching,
                 &self.config,
@@ -496,6 +512,15 @@ impl WindowContext {
     /// ID of this terminal context.
     pub fn id(&self) -> WindowId {
         self.display.window.id()
+    }
+
+    #[cfg(unix)]
+    pub fn set_tab_strip_text(&mut self, text: Option<String>) {
+        if self.tab_strip_text != text {
+            self.tab_strip_text = text;
+            self.display.pending_update.dirty = true;
+            self.dirty = true;
+        }
     }
 
     /// Write the ref test results to the disk.
@@ -532,6 +557,7 @@ impl WindowContext {
         display: &mut Display,
         notifier: &mut Notifier,
         message_buffer: &MessageBuffer,
+        tab_strip_text: Option<&str>,
         search_state: &mut SearchState,
         old_is_searching: bool,
         config: &UiConfig,
@@ -545,7 +571,14 @@ impl WindowContext {
             search_state.direction == Direction::Left
         };
 
-        display.handle_update(terminal, notifier, message_buffer, search_state, config);
+        display.handle_update(
+            terminal,
+            notifier,
+            message_buffer,
+            tab_strip_text,
+            search_state,
+            config,
+        );
 
         let new_is_searching = search_state.history_index.is_some();
         if !old_is_searching && new_is_searching {

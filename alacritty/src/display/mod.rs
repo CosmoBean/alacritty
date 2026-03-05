@@ -37,7 +37,7 @@ use alacritty_terminal::term::{
 use alacritty_terminal::vte::ansi::{CursorShape, NamedColor};
 
 use crate::config::UiConfig;
-use crate::config::debug::RendererPreference;
+use crate::config::debug::{RenderBackendPreference, RendererPreference};
 use crate::config::font::Font;
 use crate::config::window::Dimensions;
 #[cfg(not(windows))]
@@ -52,6 +52,7 @@ use crate::display::meter::Meter;
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
+use crate::renderer::backend::{BackendKind, select_backend};
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
 use crate::renderer::{self, GlyphCache, Renderer, platform};
 use crate::scheduler::{Scheduler, TimerId, Topic};
@@ -406,6 +407,15 @@ impl Display {
         config: &UiConfig,
         _tabbed: bool,
     ) -> Result<Display, Error> {
+        let selection = select_backend(config.debug.render_backend, false);
+        if selection.is_fallback(config.debug.render_backend) {
+            info!("`render_backend = \"Wgpu\"` selected; falling back to OpenGL backend");
+        } else if matches!(selection.kind, BackendKind::Wgpu) {
+            info!("Using wgpu backend");
+        } else if matches!(config.debug.render_backend, RenderBackendPreference::Gl) {
+            info!("Using OpenGL backend (`render_backend = \"Gl\"`)");
+        }
+
         let raw_window_handle = window.raw_window_handle();
 
         let scale_factor = window.scale_factor as f32;
@@ -653,6 +663,7 @@ impl Display {
         terminal: &mut Term<T>,
         pty_resize_handle: &mut dyn OnResize,
         message_buffer: &MessageBuffer,
+        tab_strip_text: Option<&str>,
         search_state: &mut SearchState,
         config: &UiConfig,
     ) where
@@ -700,10 +711,15 @@ impl Display {
         );
 
         // Update number of column/lines in the viewport.
+        let tab_strip_lines =
+            usize::from(tab_strip_text.is_some_and(|text| !text.trim().is_empty()));
         let search_active = search_state.history_index.is_some();
         let message_bar_lines = message_buffer.message().map_or(0, |m| m.text(&new_size).len());
         let search_lines = usize::from(search_active);
-        new_size.reserve_lines(message_bar_lines + search_lines);
+        new_size.reserve_lines(tab_strip_lines + message_bar_lines + search_lines);
+        if tab_strip_lines != 0 {
+            new_size.padding_y += new_size.cell_height();
+        }
 
         // Update resize increments.
         if config.window.resize_increments {
@@ -777,6 +793,7 @@ impl Display {
         mut terminal: MutexGuard<'_, Term<T>>,
         scheduler: &mut Scheduler,
         message_buffer: &MessageBuffer,
+        tab_strip_text: Option<&str>,
         config: &UiConfig,
         search_state: &mut SearchState,
     ) {
@@ -879,6 +896,10 @@ impl Display {
         }
 
         let mut rects = lines.rects(&metrics, &size_info);
+        let tab_strip_text = tab_strip_text.filter(|text| !text.trim().is_empty());
+        let tab_strip_y = tab_strip_text
+            .map(|_| (size_info.padding_y() - size_info.cell_height()).max(0.))
+            .unwrap_or_default();
 
         if let Some(vi_cursor_point) = vi_cursor_point {
             // Indicate vi mode by showing the cursor's position in the top right corner.
@@ -1006,6 +1027,40 @@ impl Display {
         } else {
             // Draw rectangles.
             self.renderer.draw_rects(&size_info, &metrics, rects);
+        }
+
+        if let Some(tab_strip_text) = tab_strip_text {
+            // Keep tab strip always visible above the terminal viewport.
+            let bg = config.colors.footer_bar_background();
+            let fg = config.colors.footer_bar_foreground();
+            let width = size_info.width() as i32;
+            let height = size_info.cell_height() as i32;
+            let strip_rect = RenderRect::new(0., tab_strip_y, width as f32, height as f32, bg, 1.);
+            self.renderer.draw_rects(&size_info, &metrics, vec![strip_rect]);
+            self.damage_tracker.frame().add_viewport_rect(
+                &size_info,
+                0,
+                tab_strip_y as i32,
+                width,
+                height,
+            );
+
+            let mut tab_size = size_info;
+            tab_size.padding_y = tab_strip_y;
+            let text = StrShortener::new(
+                tab_strip_text,
+                size_info.columns(),
+                ShortenDirection::Right,
+                Some(SHORTENER),
+            );
+            self.renderer.draw_string(
+                Point::new(0, Column(0)),
+                fg,
+                bg,
+                text,
+                &tab_size,
+                &mut self.glyph_cache,
+            );
         }
 
         self.draw_render_timer(config);
