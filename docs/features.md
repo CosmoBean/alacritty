@@ -82,3 +82,39 @@ that.
 Alacritty supports running multiple terminal emulators from the same Alacritty
 instance. New windows can be created either by using the `CreateNewWindow`
 keybinding action, or by executing the `alacritty msg create-window` subcommand.
+
+## Agent Control Plane (Preview)
+
+This fork adds a v2 IPC message envelope through `alacritty msg v2`, intended
+for agent automation workflows. The v2 interface includes machine-facing method
+dispatch with stable references (`window:N`, `workspace:N`, `surface:N`) and a
+runtime system tree (`system.tree`) that can be used to discover targets.
+
+Early methods include:
+
+- `identify`
+- `workspace.switch`
+- `system.tree`
+- `notification.create`
+- `notification.list`
+- `notification.mark_read`
+- `resolve.handle`
+- `surface.split`
+- `webview.open`
+- `webview.navigate`
+- `webview.close`
+- `webview.list`
+
+Agent UI preview behavior in this fork:
+
+- Message-bar workspace summary banner (`[Agent Tabs]`) with unread/surface/webview counts
+- Native top tab strip lane rendered in-window for workspace overview
+- Recent notification summary embedded in the same banner
+- In-window notification and acknowledgement banners (`notification.create`, `notification.mark_read`)
+- macOS system notification fan-out for `notification.create`
+- Window-title Agent summary with unread counts and workspace indicators
+- Closing an agent notification banner (`[X]`) auto-acknowledges the latest unread notification for that workspace
+
+Additional methods like `workspace.create`, `workspace.close`, `workspace.move`,
+and `surface.close` are reserved and currently return a structured "pending
+implementation" error.
